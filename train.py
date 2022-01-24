@@ -702,7 +702,7 @@ def main():
             shutil.copy(history_dir+'epoch{:03d}_metrics.pkl'.format(best_epoch), checkpoint_dir + 'metrics.pkl')
             shutil.copy(history_dir+'epoch{:03d}_constant_metrics.pkl'.format(best_epoch), checkpoint_dir + 'constant_metrics.pkl')
             shutil.copy(history_dir+'epoch{:03d}_val_best.pth'.format(best_epoch), checkpoint_dir + 'val_best.pth')
-        wandb.log( "loss": metrics['train_loss'], "epoch" : args.num_epochs)
+        wandb.log( {"loss": metrics['train_loss'][-1], "epoch" : args.num_epochs} )
 
 if __name__ == '__main__':
     sweep_config = {
