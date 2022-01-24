@@ -3,6 +3,7 @@ import pickle
 import argparse
 import random
 import shutil
+import wandb
 
 import torch.distributions.multivariate_normal as torchdist
 import torch.multiprocessing as multiprocessing
@@ -19,12 +20,11 @@ random.seed(random_seed)
 np.random.seed(random_seed)
 torch.manual_seed(random_seed)
 
-
 def graph_loss(V_pred, V_target):
     return bivariate_loss(V_pred,V_target)
 
 
-def train(model, contrastive, optimizer, device, loader_train, epoch, metrics, args):
+def train(model, contrastive, optimizer, device, loader_train, epoch, metrics, args, config):
     model.train()
     loss_batch, loss_total_batch, loss_contrast_batch = 0, 0, 0
     batch_count = 0
@@ -38,7 +38,7 @@ def train(model, contrastive, optimizer, device, loader_train, epoch, metrics, a
         # Get data
         batch = [tensor.to(device) for tensor in batch]
         obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped,\
-         loss_mask, V_obs, A_obs, V_tr, A_tr, safety_gt_ = batch
+        loss_mask, V_obs, A_obs, V_tr, A_tr, safety_gt_ = batch
         # dimensionality reminder: obs_traj: [1, num_person, 2, 8]; pred_traj_gt: [1, num_person, 2, 12]
 
         pick_safe_traj = args.safe_traj
@@ -75,7 +75,7 @@ def train(model, contrastive, optimizer, device, loader_train, epoch, metrics, a
                 loss += l
 
             # contrastive task
-            if args.contrast_weight > 0:
+            if config["contrast_weight"] > 0:
                 # Recall dimensionality:
                 # obs_traj: [1, num_person, 2, 8]; pred_traj_gt: [1, num_person, 2, 12]
 
@@ -86,18 +86,18 @@ def train(model, contrastive, optimizer, device, loader_train, epoch, metrics, a
                 pedestrain_states = torch.zeros([num_person, 6]).float().to(device)
                 pedestrain_states[:, :2] = obs_traj[0, :, :, -1]  # pick input's last frame
 
-                pos_seeds = pred_traj_gt[0, :, :, :args.contrast_horizon].permute(0, 2, 1)  # [num_person, H, 2]
+                pos_seeds = pred_traj_gt[0, :, :, :config["horizon"]].permute(0, 2, 1)  # [num_person, H, 2]
 
                 # trick: swap primary agent for N times, N = num_person
-                neg_seeds = torch.zeros([num_person, args.contrast_horizon, num_neighbors, 2]).float().to(device)  # [num_person, H, num_person-1, 2]
+                neg_seeds = torch.zeros([num_person, config["horizon"], num_neighbors, 2]).float().to(device)  # [num_person, H, num_person-1, 2]
                 for idx_primary in range(num_person):
                     neighbor_idxes = np.delete(np.arange(num_person), idx_primary)
-                    neg_seeds_tmp = pred_traj_gt[0, np.ix_(neighbor_idxes), :, :args.contrast_horizon].squeeze(0)  # [num_person-1, 2, H]
+                    neg_seeds_tmp = pred_traj_gt[0, np.ix_(neighbor_idxes), :, :config["horizon"]].squeeze(0)  # [num_person-1, 2, H]
                     neg_seeds[idx_primary] = neg_seeds_tmp.permute(2, 0, 1)  # [H, num_person-1, 2]
 
                 hist_traj = V_obs_tmp.permute(3, 2, 1, 0).reshape(num_person, -1).contiguous()  # [num_person, 16] <- [1, 2, 8, num_person]
                 l_contrast = contrastive.loss(pedestrain_states, pos_seeds, neg_seeds, feat_vec, hist_traj)
-                loss_contrast += l_contrast * args.contrast_weight
+                loss_contrast += l_contrast * config["contrast_weight"]
 
         else:
             is_fst_loss = True
@@ -116,12 +116,11 @@ def train(model, contrastive, optimizer, device, loader_train, epoch, metrics, a
             loss_contrast_batch += loss_contrast.item()
             loss_total_batch += loss_total.item()
             print('TRAIN:','\t Epoch:', epoch,'\t Total loss:',loss_total_batch/batch_count, '\t task loss:', loss_batch/batch_count,
-                  '\t contrast loss:', loss_contrast_batch/batch_count)
+                '\t contrast loss:', loss_contrast_batch/batch_count)
 
     metrics['train_loss'].append(loss_total_batch/batch_count)
     metrics['task_loss'].append(loss_batch/batch_count)
-    metrics['contrast_loss'].append(loss_contrast_batch/batch_count)
-    
+    metrics['contrast_loss'].append(loss_contrast_batch/batch_count)    
 
 def vald(model, device, loader_val, epoch, metrics, constant_metrics, args, checkpoint_dir):
     model.eval()
@@ -449,7 +448,7 @@ def get_target_metrics(dataset: str, tolerance: float = 0.0):
     return target_ade+tolerance, target_fde+tolerance, target_col
 
 
-def config_model(args, device):
+def config_model(args, device, config):
     """Define the model."""
     model = social_stgcnn(n_stgcnn=args.n_stgcnn, n_txpcnn=args.n_txpcnn,
                           output_feat=args.output_size, seq_len=args.obs_seq_len,
@@ -466,8 +465,8 @@ def config_model(args, device):
 
     # contrastive
     if args.contrast_loss == 'nce':
-        contrastive = SocialNCE(projection_head, encoder_sample, args.contrast_sampling, args.contrast_horizon,
-                                args.contrast_nboundary, args.contrast_temperature, args.contrast_range,
+        contrastive = SocialNCE(projection_head, encoder_sample, args.contrast_sampling, config["horizon"],
+                                args.contrast_nboundary, config["temperature"], args.contrast_range,
                                 args.ratio_boundary, args.contrast_minsep)
     else:
         raise NotImplementedError
@@ -576,133 +575,156 @@ def pick_from_log(log_path: str, min_epoch: int = 50):
 
 
 def main():
+    with wandb.init() as run:
+        args = config_parser()
+        config = wandb.config
 
-    args = config_parser()
+        device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
-    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-
-    target_ade, target_fde, target_col = get_target_metrics(args.dataset)
-    # to be very conservative
-    target_ade -= 0.05
-    target_fde -= 0.05
-
-    print('*' * 30)
-    print("Training initiating....")
-    print(args)
-
-    # Define the model
-    model, contrastive = config_model(args, device)
-
-    # Data loader
-    loader_train, loader_val, loader_test = get_dataloader(args.dataset, args.obs_seq_len, args.pred_seq_len)
-
-    # Optimizer settings
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
-
-    if args.use_lrschd:
-        patience_epoch = args.lr_sh_rate
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=patience_epoch, threshold=0.01,
-                                                         factor=0.5, cooldown=patience_epoch, min_lr=1e-5, verbose=True)
-
-    # Training log settings
-    checkpoint_dir = './checkpoint/' + args.tag + '/'
-    history_dir = os.path.join(checkpoint_dir, 'history') + '/'
-    csv_path = os.path.join(checkpoint_dir, 'training_log.csv')
-
-    for folder in [checkpoint_dir, history_dir]:
-        if not os.path.exists(folder):
-            os.makedirs(folder)
-
-    # save argument once and for all
-    with open(checkpoint_dir + 'args.pkl', 'wb') as fp:
-        pickle.dump(args, fp)
-
-    print('Checkpoint dir:', checkpoint_dir)
-
-    metrics = {'train_loss': [], 'task_loss': [], 'contrast_loss': [], 'val_loss': []}
-    constant_metrics = {'min_val_epoch': -1, 'min_val_loss': 9999999999999999}
-
-    # Start training
-    print('Training started ...')
-    ade_ls, fde_ls, coll_ls, ttl_error_ls = [], [], [], []
-    best_ade, best_fde, best_coll, best_ttl_error, best_coll_joint_c4_error, best_coll_joint_c4 = 99999., 99999., 99999., 99999., 99999., 99999.
-
-    df = pandas.DataFrame(columns=['Epoch', 'total_loss', 'task_loss', 'contrast_loss', 'validation_loss', 'ADE', 'FDE', 'COLL'])
-    for epoch in range(args.num_epochs):
-        time_start = time.time()
-        train(model, contrastive, optimizer, device, loader_train, epoch, metrics, args)
-        time_elapsed = time.time() - time_start
-        print('Time to train once: {:.2f} s for dataset {:s}'.format(time_elapsed, args.dataset))
-
-        time_start = time.time()
-        vald(model, device, loader_val, epoch, metrics, constant_metrics, args, checkpoint_dir)
-        time_elapsed = time.time() - time_start
-        print('Time to validate once: {:.2f} s for dataset {:s}'.format(time_elapsed, args.dataset))
-        if args.use_lrschd:
-            ttl_loss = metrics['train_loss'][-1]
-            scheduler.step(ttl_loss)  # learning rate decay once training stagnates
+        target_ade, target_fde, target_col = get_target_metrics(args.dataset)
+        # to be very conservative
+        target_ade -= 0.05
+        target_fde -= 0.05
 
         print('*' * 30)
-        print('Epoch:', args.tag, ":", epoch)
-        for k, v in metrics.items():
-            if len(v) > 0:
-                print(k, v[-1])
+        print("Training initiating....")
+        print(args)
 
-        """Test per epoch"""
-        ade_, fde_, coll_ = 999999.0, 999999.0, 999999.0
-        print("Testing ....")
-        time_start = time.time()
-        ad, fd, coll, coll_joint_step, coll_joint_cum, coll_cross_step, coll_cross_cum, coll_truth_step, coll_truth_cum, _ = test(
-            model, device, loader_test, epoch)
-        time_elapsed = time.time() - time_start
-        print('Time to test once: {:.2f} s for dataset {:s}'.format(time_elapsed, args.dataset))
-        ade_, fde_, coll_ = min(ade_, ad), min(fde_, fd), min(coll_, coll_joint_cum[2])
-        ttl_error_ = np.clip(ade_ - target_ade, a_min=0.0, a_max=None) + np.clip(fde_ - target_fde, a_min=0.0, a_max=None) + coll_
+        # Define the model
+        model, contrastive = config_model(args, device, config)
 
-        ade_ls.append(ade_)
-        fde_ls.append(fde_)
-        coll_ls.append(coll_)
-        ttl_error_ls.append(ttl_error_)
-        print("ADE: {:.4f}, FDE: {:.4f}, COL: {:.4f}, Total ERROR: {:.4f}, COL_JOINT_C4: {:.4F}".format(
-            ade_, fde_, coll_, ttl_error_, coll_joint_cum[2]))
+        # Data loader
+        loader_train, loader_val, loader_test = get_dataloader(args.dataset, args.obs_seq_len, args.pred_seq_len)
 
-        best_ade = min(ade_, best_ade)
-        best_fde = min(fde_, best_fde)
-        best_coll = min(coll_, best_coll)
-        best_ttl_error = min(ttl_error_, best_ttl_error)
-        best_coll_joint_c4 = min(coll_joint_cum[2], best_coll_joint_c4)
-        print(
-            "Best ADE: {:.4f}, Best FDE: {:.4f}, Best COL: {:.4f}, Best Total ERROR: {:.4f}, Best COL_JOINT_C4: {:.4F}".format(
-                best_ade, best_fde, best_coll, best_ttl_error, best_coll_joint_c4))
+        # Optimizer settings
+        optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
-        df.loc[len(df)] = [epoch, metrics['train_loss'][-1], metrics['task_loss'][-1], metrics['contrast_loss'][-1],
-                           metrics['val_loss'][-1], ade_, fde_, coll_]
-        df = df.sort_values(by=['Epoch'])
-        if not os.path.exists(csv_path):
-            df.iloc[-1:].to_csv(csv_path, mode='a', index=False)
-        else:
-            df.iloc[-1:].to_csv(csv_path, mode='a', header=False, index=False)
+        if args.use_lrschd:
+            patience_epoch = args.lr_sh_rate
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=patience_epoch, threshold=0.01,
+                                                            factor=0.5, cooldown=patience_epoch, min_lr=1e-5, verbose=True)
 
-        best_epoch = pick_from_log(csv_path, 0)
-        print('Best epoch up to now is {}'.format(best_epoch))
-        """Test ends"""
+        # Training log settings
+        checkpoint_dir = './checkpoint/' + args.tag + '/'
+        history_dir = os.path.join(checkpoint_dir, 'history') + '/'
+        csv_path = os.path.join(checkpoint_dir, 'training_log.csv')
 
-        print(constant_metrics)
-        print('*'*30)
+        for folder in [checkpoint_dir, history_dir]:
+            if not os.path.exists(folder):
+                os.makedirs(folder)
 
-        with open(history_dir+'epoch{:03d}_metrics.pkl'.format(epoch), 'wb') as fp:
-            pickle.dump(metrics, fp)
+        # save argument once and for all
+        with open(checkpoint_dir + 'args.pkl', 'wb') as fp:
+            pickle.dump(args, fp)
 
-        with open(history_dir+'epoch{:03d}_constant_metrics.pkl'.format(epoch), 'wb') as fp:
-            pickle.dump(constant_metrics, fp)
+        print('Checkpoint dir:', checkpoint_dir)
 
-        torch.save(model.state_dict(), history_dir + 'epoch{:03d}_val_best.pth'.format(epoch))
+        metrics = {'train_loss': [], 'task_loss': [], 'contrast_loss': [], 'val_loss': []}
+        constant_metrics = {'min_val_epoch': -1, 'min_val_loss': 9999999999999999}
 
-        # model selection
-        shutil.copy(history_dir+'epoch{:03d}_metrics.pkl'.format(best_epoch), checkpoint_dir + 'metrics.pkl')
-        shutil.copy(history_dir+'epoch{:03d}_constant_metrics.pkl'.format(best_epoch), checkpoint_dir + 'constant_metrics.pkl')
-        shutil.copy(history_dir+'epoch{:03d}_val_best.pth'.format(best_epoch), checkpoint_dir + 'val_best.pth')
+        # Start training
+        print('Training started ...')
+        ade_ls, fde_ls, coll_ls, ttl_error_ls = [], [], [], []
+        best_ade, best_fde, best_coll, best_ttl_error, best_coll_joint_c4_error, best_coll_joint_c4 = 99999., 99999., 99999., 99999., 99999., 99999.
 
+        df = pandas.DataFrame(columns=['Epoch', 'total_loss', 'task_loss', 'contrast_loss', 'validation_loss', 'ADE', 'FDE', 'COLL'])
+        for epoch in range(args.num_epochs):
+            time_start = time.time()
+            train(model, contrastive, optimizer, device, loader_train, epoch, metrics, args, config)
+            time_elapsed = time.time() - time_start
+            print('Time to train once: {:.2f} s for dataset {:s}'.format(time_elapsed, args.dataset))
+
+            time_start = time.time()
+            vald(model, device, loader_val, epoch, metrics, constant_metrics, args, checkpoint_dir)
+            time_elapsed = time.time() - time_start
+            print('Time to validate once: {:.2f} s for dataset {:s}'.format(time_elapsed, args.dataset))
+            if args.use_lrschd:
+                ttl_loss = metrics['train_loss'][-1]
+                scheduler.step(ttl_loss)  # learning rate decay once training stagnates
+
+            print('*' * 30)
+            print('Epoch:', args.tag, ":", epoch)
+            for k, v in metrics.items():
+                if len(v) > 0:
+                    print(k, v[-1])
+
+            """Test per epoch"""
+            ade_, fde_, coll_ = 999999.0, 999999.0, 999999.0
+            print("Testing ....")
+            time_start = time.time()
+            ad, fd, coll, coll_joint_step, coll_joint_cum, coll_cross_step, coll_cross_cum, coll_truth_step, coll_truth_cum, _ = test(
+                model, device, loader_test, epoch)
+            time_elapsed = time.time() - time_start
+            print('Time to test once: {:.2f} s for dataset {:s}'.format(time_elapsed, args.dataset))
+            ade_, fde_, coll_ = min(ade_, ad), min(fde_, fd), min(coll_, coll_joint_cum[2])
+            ttl_error_ = np.clip(ade_ - target_ade, a_min=0.0, a_max=None) + np.clip(fde_ - target_fde, a_min=0.0, a_max=None) + coll_
+
+            ade_ls.append(ade_)
+            fde_ls.append(fde_)
+            coll_ls.append(coll_)
+            ttl_error_ls.append(ttl_error_)
+            print("ADE: {:.4f}, FDE: {:.4f}, COL: {:.4f}, Total ERROR: {:.4f}, COL_JOINT_C4: {:.4F}".format(
+                ade_, fde_, coll_, ttl_error_, coll_joint_cum[2]))
+
+            best_ade = min(ade_, best_ade)
+            best_fde = min(fde_, best_fde)
+            best_coll = min(coll_, best_coll)
+            best_ttl_error = min(ttl_error_, best_ttl_error)
+            best_coll_joint_c4 = min(coll_joint_cum[2], best_coll_joint_c4)
+            print(
+                "Best ADE: {:.4f}, Best FDE: {:.4f}, Best COL: {:.4f}, Best Total ERROR: {:.4f}, Best COL_JOINT_C4: {:.4F}".format(
+                    best_ade, best_fde, best_coll, best_ttl_error, best_coll_joint_c4))
+
+            df.loc[len(df)] = [epoch, metrics['train_loss'][-1], metrics['task_loss'][-1], metrics['contrast_loss'][-1],
+                            metrics['val_loss'][-1], ade_, fde_, coll_]
+            df = df.sort_values(by=['Epoch'])
+            if not os.path.exists(csv_path):
+                df.iloc[-1:].to_csv(csv_path, mode='a', index=False)
+            else:
+                df.iloc[-1:].to_csv(csv_path, mode='a', header=False, index=False)
+
+            best_epoch = pick_from_log(csv_path, 0)
+            print('Best epoch up to now is {}'.format(best_epoch))
+            """Test ends"""
+
+            print(constant_metrics)
+            print('*'*30)
+
+            with open(history_dir+'epoch{:03d}_metrics.pkl'.format(epoch), 'wb') as fp:
+                pickle.dump(metrics, fp)
+
+            with open(history_dir+'epoch{:03d}_constant_metrics.pkl'.format(epoch), 'wb') as fp:
+                pickle.dump(constant_metrics, fp)
+
+            torch.save(model.state_dict(), history_dir + 'epoch{:03d}_val_best.pth'.format(epoch))
+
+            # model selection
+            shutil.copy(history_dir+'epoch{:03d}_metrics.pkl'.format(best_epoch), checkpoint_dir + 'metrics.pkl')
+            shutil.copy(history_dir+'epoch{:03d}_constant_metrics.pkl'.format(best_epoch), checkpoint_dir + 'constant_metrics.pkl')
+            shutil.copy(history_dir+'epoch{:03d}_val_best.pth'.format(best_epoch), checkpoint_dir + 'val_best.pth')
+        wandb.log( "loss": metrics['train_loss'], "epoch" : args.num_epochs)
 
 if __name__ == '__main__':
-    main()
+    sweep_config = {
+    "name" : "sweepy",
+    "method" : "random",
+    "parameters" : {
+        "temperature" : {
+            "min" : 0.1,
+            "max" : 0.5
+        },
+        "horizon" : {
+            "values" : [1, 2, 3, 4, 5]
+        },
+        "contrast_weight" : {
+            "min" : 0,
+            "max" : 50
+        }
+
+      }
+    }
+
+    sweep_id = wandb.sweep(sweep_config)
+
+    count = 1
+    wandb.agent(sweep_id, function=main, count=count)
