@@ -4,7 +4,7 @@
   <img src="docs/illustration.png" width="300">
 </p>
 
-This is an official implementation of the Social-NCE applied to the Social-STGCNN forecasting model.
+This is a modifiief implementation of the Social-NCE applied to the Social-STGCNN forecasting model, integrated with WandB to carry out hyperparameter tuning.
 
 **[Social NCE: Contrastive Learning of Socially-aware Motion Representations](https://arxiv.org/abs/2012.11717)**
 <br>by
